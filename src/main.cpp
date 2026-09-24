@@ -61,6 +61,7 @@ constexpr uint8_t kRegisterGain = 0x04;
 constexpr uint8_t kRegisterTrigger = 0x05;
 constexpr uint8_t kRegisterDac = 0x08;
 constexpr uint16_t kSoftReset = 0x000A;
+constexpr uint16_t kReferenceAndDacPowerDown = 0x0101;
 constexpr uint16_t kRefDivideBy2GainBy2 = 0x0101;
 }  // namespace Dac80501
 
@@ -342,11 +343,12 @@ void printStatus() {
 void printHelp() {
   Serial.println();
   Serial.println(F("Electronic load bring-up firmware"));
-  Serial.println(F("Startup recovery v2; DAC SPI writes have no readback."));
+  Serial.println(F("Startup recovery v3; DAC SPI writes have no readback."));
   Serial.println(F("  status       read voltage, current, temperature and fault"));
   Serial.println(F("  i <amps>     set 0.000 to 0.250 A (slow ramp upward)"));
   Serial.println(F("  off          immediately write zero to the DAC"));
   Serial.println(F("  clear        reinitialize DAC/ADC and check safety; stays off"));
+  Serial.println(F("  dacref       DUT disconnected: reference off 5 s, then restore"));
   Serial.println(F("  help         show this list"));
   Serial.println(F("Use a current-limited DUT supply and an oscilloscope."));
   Serial.println();
@@ -458,6 +460,37 @@ void clearFaultIfSafe() {
   Serial.println(F("DAC configuration sent; ADC/safety checks passed. Output commanded zero."));
 }
 
+void testDacReference() {
+  // No ADC/DAC readback can verify this test: observe VREFIO with a meter.
+  // Always leave the load latched off; never resume the previous current.
+  latchFault("DAC reference test; run clear before loading");
+  initializeDac();
+  forceLoadOff();
+  Serial.println(F("DACREF: DUT must be disconnected. Measure VREFIO to GND."));
+  Serial.println(F("DACREF: reference ON requested; expect about 2.5 V (2 s)."));
+  delay(2000);
+
+  // CONFIG bit 8 disables the reference; bit 0 grounds VOUT via 1 kohm.
+  dacWriteRegister(Dac80501::kRegisterConfig,
+                   Dac80501::kReferenceAndDacPowerDown);
+  Serial.println(F("DACREF: reference OFF requested for 5 s (03 01 01)."));
+  Serial.println(F("Watch for a fall; the reference capacitor may discharge slowly."));
+  const uint32_t startedMs = millis();
+  while (millis() - startedMs < 5000) {
+    if (hardwareFaultActive()) {
+      latchFault("temperature comparator asserted during DAC reference test");
+    }
+    delay(1);
+  }
+
+  // Restore even if FAULT_N asserted; only the reference/configuration is
+  // restored, with a zero DAC code and the software fault still latched.
+  initializeDac();
+  forceLoadOff();
+  Serial.println(F("DACREF: reference ON requested; expect return to about 2.5 V."));
+  Serial.println(F("Test finished. Load remains latched off. No automatic pass/fail."));
+}
+
 void processCommand(char* line) {
   char command[16] = {};
   float value = 0.0F;
@@ -475,6 +508,8 @@ void processCommand(char* line) {
     Serial.println(F("Load command is zero."));
   } else if (strcmp(command, "clear") == 0) {
     clearFaultIfSafe();
+  } else if (strcmp(command, "dacref") == 0) {
+    testDacReference();
   } else if ((strcmp(command, "i") == 0 ||
               strcmp(command, "current") == 0) &&
              fields == 2) {
