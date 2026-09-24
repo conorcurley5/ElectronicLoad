@@ -16,7 +16,7 @@ constexpr uint8_t kMiso = 13;
 namespace Limits {
 // Deliberately low for initial board bring-up. Raise only after validating the
 // control-loop waveform, heatsink, current calibration, and fault behaviour.
-constexpr float kMaximumTestCurrentA = 0.250F;
+constexpr float kMaximumTestCurrentA = 0.100F;
 constexpr float kRampStepA = 0.010F;
 constexpr uint32_t kRampStepDelayMs = 20;
 constexpr uint16_t kThermistorOpenCode = 32600;
