@@ -55,6 +55,8 @@ constexpr uint32_t kConversionTimeMs = 60;
 }  // namespace Ads1120
 
 namespace Dac80501 {
+constexpr uint8_t kRegisterSync = 0x02;
+constexpr uint8_t kRegisterConfig = 0x03;
 constexpr uint8_t kRegisterGain = 0x04;
 constexpr uint8_t kRegisterTrigger = 0x05;
 constexpr uint8_t kRegisterDac = 0x08;
@@ -97,6 +99,8 @@ void dacWriteRegister(uint8_t address, uint16_t value) {
   SPI.transfer(static_cast<uint8_t>(value));
   digitalWrite(Pins::kDacCs, HIGH);
   SPI.endTransaction();
+  // Explicit margin for SYNC high time and sequential DAC update timing.
+  delayMicroseconds(2);
 }
 
 void dacWriteCode(uint16_t code) {
@@ -281,10 +285,15 @@ bool initializeAdc() {
 
 void initializeDac() {
   dacWriteRegister(Dac80501::kRegisterTrigger, Dac80501::kSoftReset);
-  delayMicroseconds(300);
+  delay(2);  // POR requires 250 us; allow extra settling margin.
+  // Load zero before enabling the output or changing its range. The fitted
+  // DAC60501Z resets to zero; this sequence also clears stale buffer contents.
   dacWriteCode(0);
+  dacWriteRegister(Dac80501::kRegisterSync, 0x0000);
   dacWriteRegister(Dac80501::kRegisterGain,
                    Dac80501::kRefDivideBy2GainBy2);
+  dacWriteRegister(Dac80501::kRegisterConfig, 0x0000);
+  delay(2);
   dacWriteCode(0);
 }
 
@@ -333,14 +342,17 @@ void printStatus() {
 void printHelp() {
   Serial.println();
   Serial.println(F("Electronic load bring-up firmware"));
+  Serial.println(F("Startup recovery v2; DAC SPI writes have no readback."));
   Serial.println(F("  status       read voltage, current, temperature and fault"));
   Serial.println(F("  i <amps>     set 0.000 to 0.250 A (slow ramp upward)"));
   Serial.println(F("  off          immediately write zero to the DAC"));
-  Serial.println(F("  clear        clear a safe, inactive fault; output stays off"));
+  Serial.println(F("  clear        reinitialize DAC/ADC and check safety; stays off"));
   Serial.println(F("  help         show this list"));
   Serial.println(F("Use a current-limited DUT supply and an oscilloscope."));
   Serial.println();
 }
+
+void clearFaultIfSafe();
 
 void applyCurrentCommand(float targetA) {
   if (!std::isfinite(targetA) || targetA < 0.0F ||
@@ -360,6 +372,16 @@ void applyCurrentCommand(float targetA) {
   if (faultLatched || !adcHealthy || hardwareFaultActive()) {
     forceLoadOff();
     Serial.println(F("Rejected: clear the fault after correcting its cause."));
+    return;
+  }
+
+  // Recover a DAC that powered up late or lost its configuration. Always
+  // restart from zero and recheck the ADC/temperature before ramping. Existing
+  // faults above still require an explicit clear command from the operator.
+  clearFaultIfSafe();
+  if (faultLatched || !adcHealthy || hardwareFaultActive()) {
+    forceLoadOff();
+    Serial.println(F("Rejected: peripheral recovery/safety check failed."));
     return;
   }
 
@@ -390,33 +412,50 @@ void applyCurrentCommand(float targetA) {
 
 void clearFaultIfSafe() {
   forceLoadOff();
+  faultLatched = true;
+  faultReason = "peripheral recovery pending";
+  initializeDac();
+  // Retry even if the ADC was absent at ESP32 startup. The old implementation
+  // cached a failed startup check forever, so clear could never recover it.
+  adcHealthy = initializeAdc();
   if (!adcHealthy) {
+    latchFault("ADS1120 register readback failed");
     Serial.println(F("Cannot clear: ADC communication is unhealthy."));
     return;
   }
   if (hardwareFaultActive()) {
+    latchFault("temperature comparator asserted");
     Serial.println(F("Cannot clear: FAULT_N is still low."));
     return;
   }
 
+  // Allow the conversion wait to latch even a short FAULT_N pulse, and do
+  // not discard that event just because the pin is high again afterward.
+  faultLatched = false;
   const Measurements measurements = readMeasurements();
+  if (faultLatched) {
+    Serial.println(F("Cannot clear: fault occurred during measurements."));
+    return;
+  }
   if (hardwareFaultActive()) {
     latchFault("temperature comparator asserted while clearing");
     Serial.println(F("Cannot clear: FAULT_N asserted during checks."));
     return;
   }
   if (!measurements.thermistorValid) {
+    latchFault("thermistor open or invalid");
     Serial.println(F("Cannot clear: thermistor is open or invalid."));
     return;
   }
   if (measurements.temperatureC >= Limits::kSoftwareTemperatureLimitC) {
+    latchFault("software temperature limit reached");
     Serial.println(F("Cannot clear: measured temperature is too high."));
     return;
   }
 
   faultLatched = false;
   faultReason = "none";
-  Serial.println(F("Fault cleared. DAC remains at zero."));
+  Serial.println(F("DAC configuration sent; ADC/safety checks passed. Output commanded zero."));
 }
 
 void processCommand(char* line) {
@@ -471,6 +510,11 @@ void setup() {
   digitalWrite(Pins::kDacCs, HIGH);
   pinMode(Pins::kFaultN, INPUT);
 
+  SPI.begin(Pins::kSclk, Pins::kMiso, Pins::kMosi);
+  delay(10);  // Initial settling margin, not a guarantee of board power presence.
+  initializeDac();
+  forceLoadOff();
+
   Serial.begin(115200);
   // Native USB CDC may enumerate after setup starts. Do not wait forever,
   // because safety initialization must proceed even without a host attached.
@@ -478,8 +522,7 @@ void setup() {
   while (!Serial && millis() - serialWaitStartedMs < 1500) {
     delay(10);
   }
-  SPI.begin(Pins::kSclk, Pins::kMiso, Pins::kMosi);
-
+  // Repeat after USB enumeration in case the board rail came up meanwhile.
   initializeDac();
   forceLoadOff();
   adcHealthy = initializeAdc();
